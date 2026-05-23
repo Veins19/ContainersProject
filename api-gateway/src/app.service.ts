@@ -1,45 +1,77 @@
-import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 
-@Injectable()
-export class AppService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
-  async onModuleInit() { await this.$connect(); }
-  async onModuleDestroy() { await this.$disconnect(); }
+const prisma = new PrismaClient();
 
-  async askQuestion(userQuestion: string) {
+@Injectable()
+export class AppService {
+  
+  async askQuestion(question: string, userId: string, engine: string) {
     try {
+      // 1. Fetch the last 5 conversation turns (10 messages total)
+      const recentLogs = await prisma.queryLog.findMany({
+        where: { userId },
+        orderBy: { createdAt: 'desc' },
+        take: 5
+      });
+
+      // 2. Reverse them so the oldest is first, establishing chronological order
+      recentLogs.reverse();
+
+      // 3. Format them cleanly for Python
+      const chatHistory = recentLogs.map(log => ({
+        user: log.question,
+        assistant: log.answer
+      }));
+
+      // 4. Send the question, engine, AND history to Python
       const response = await fetch('http://ai-worker:8000/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: userQuestion }),
+        body: JSON.stringify({ 
+          question, 
+          user_id: userId, 
+          engine,
+          chat_history: chatHistory 
+        }) 
       });
-      const aiData = await response.json();
-
-      await this.queryLog.create({
-        data: { question: userQuestion, answer: aiData.answer || JSON.stringify(aiData) },
-      });
-
-      return { answer: aiData.answer, context: aiData.retrieved_context };
+      
+      const data = await response.json();
+      
+      // 5. Save the NEW interaction to Postgres so it is remembered next time
+      if (data.status === 'Success') {
+        await prisma.queryLog.create({ data: { question, answer: data.answer, userId } });
+      }
+      
+      return data;
     } catch (error) {
-      return { answer: "Error connecting to AI logic." };
+      throw new HttpException('AI Worker unreachable', HttpStatus.SERVICE_UNAVAILABLE);
     }
   }
 
-  async uploadDocument(file: Express.Multer.File) {
-    try {
-      const formData = new FormData();
-      
-      // FIX: Cast file.buffer to 'any' to bypass the TypeScript strictness check
-      const blob = new Blob([file.buffer as any], { type: file.mimetype });
-      formData.append('file', blob, file.originalname);
+  async getUserDocuments(userId: string) {
+    return await prisma.document.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' }
+    });
+  }
 
-      const response = await fetch('http://ai-worker:8000/upload', {
-        method: 'POST',
-        body: formData, 
+  async deleteDocument(documentId: string, userId: string) {
+    const doc = await prisma.document.findFirst({ where: { id: documentId, userId } });
+    if (!doc) throw new HttpException('Document not found', HttpStatus.NOT_FOUND);
+    
+    await prisma.document.delete({ where: { id: documentId } });
+
+    try {
+      await fetch(`http://ai-worker:8000/documents/${documentId}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId })
       });
-      return await response.json();
-    } catch (error) {
-      return { status: "Error", message: "Gateway failed to reach AI Worker." };
+    } catch (e) {
+      console.error("Failed to reach Python worker for vector deletion");
     }
+
+    return { success: true, message: 'Document deleted successfully' };
   }
 }

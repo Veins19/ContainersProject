@@ -1,31 +1,59 @@
 import { WebSocketGateway, SubscribeMessage, MessageBody, ConnectedSocket } from '@nestjs/websockets';
 import { Socket } from 'socket.io';
 import WebSocket from 'ws';
+import { JwtService } from '@nestjs/jwt';
+import { PrismaClient } from '@prisma/client';
 
-// FIX: Increase the default 1MB limit to 50MB so large PDFs can pass through!
+const prisma = new PrismaClient();
+const jwtService = new JwtService({ secret: process.env.JWT_SECRET || 'super-secret-development-key' });
+
 @WebSocketGateway({ cors: true, maxHttpBufferSize: 5e7 })
 export class AppGateway {
   @SubscribeMessage('upload_file')
-  handleUpload(@MessageBody() data: { filename: string, buffer: ArrayBuffer }, @ConnectedSocket() client: Socket) {
-    const ext = data.filename.split('.').pop();
-    
-    // Connect to Python's internal K8s address
-    const ws = new WebSocket('ws://ai-worker:8000/ws/upload');
+  async handleUpload(@MessageBody() data: { filename: string, buffer: ArrayBuffer, token: string }, @ConnectedSocket() client: Socket) {
+    try {
+      // 1. Verify the VIP Pass
+      if (!data.token) throw new Error("No token provided");
+      const decoded = jwtService.verify(data.token);
+      const userId = decoded.sub;
 
-    ws.on('open', () => {
-      // Send metadata first, then the binary buffer
-      ws.send(JSON.stringify({ ext }));
-      ws.send(data.buffer);
-    });
+      // 2. THE REHASHING FIX: Check if this file already exists in Postgres
+      let doc = await prisma.document.findFirst({
+        where: { filename: data.filename, userId }
+      });
 
-    // When Python sends a progress update, pipe it straight to React!
-    ws.on('message', (message) => {
-      const parsed = JSON.parse(message.toString());
-      client.emit('upload_progress', parsed);
-    });
+      // 3. If it doesn't exist, create it. If it DOES exist, we reuse the exact same ID!
+      if (!doc) {
+        doc = await prisma.document.create({
+          data: { filename: data.filename, userId }
+        });
+      }
 
-    ws.on('error', (err) => {
-      client.emit('upload_progress', { progress: 0, status: 'Error', message: 'Failed to connect to AI Worker.' });
-    });
+      const ext = data.filename.split('.').pop();
+      const ws = new WebSocket('ws://ai-worker:8000/ws/upload');
+
+      ws.on('open', () => {
+        // 4. Send metadata + user_id + the stable document_id to Python
+        ws.send(JSON.stringify({ ext, user_id: userId, document_id: doc.id }));
+        ws.send(data.buffer);
+      });
+
+      ws.on('message', (message) => {
+        const parsed = JSON.parse(message.toString());
+        client.emit('upload_progress', parsed);
+      });
+
+      ws.on('error', (err) => {
+        client.emit('upload_progress', { progress: 0, status: 'Error', message: 'Failed to connect to AI Worker.' });
+      });
+
+    } catch (error: any) {
+      console.error("UPLOAD CRASH:", error); 
+      client.emit('upload_progress', { 
+        progress: 0, 
+        status: 'Error', 
+        message: error.message || 'Internal server error during upload.' 
+      });
+    }
   }
 }

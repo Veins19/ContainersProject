@@ -2,9 +2,12 @@ fastapi
 uvicorn
 chromadb
 google-generativeai
-python-multipart
 pypdf
 python-docx
 python-pptx
-websockets
 python-dotenv
+requests
+langchain-text-splitters
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+sentence-transformers
